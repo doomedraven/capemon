@@ -53,6 +53,7 @@ extern void loq(int index, const char *category, const char *name,
 extern void log_flush();
 extern PVOID _KiUserExceptionDispatcher;
 extern lookup_t SoftBPs, SyscallBPs;
+extern int _pipe_sprintf(char *out, const char *fmt, va_list args);
 
 char *ModuleName, *PreviousModuleName;
 PVOID ModuleBase, DumpAddress, ReturnAddress, BreakOnReturnAddress, BreakOnNtContinueCallback, PreviousJumps[4];
@@ -2570,6 +2571,84 @@ BOOL SoftwareBreakpointCallback(struct _EXCEPTION_POINTERS* ExceptionInfo)
 	}
 	else
 		SetSingleStepMode(ExceptionInfo->ContextRecord, Trace);
+
+	return TRUE;
+}
+
+#define SOLO_PIPE "\\\\.\\pipe\\debugger_pipe"
+#define BUFFER_SIZE 2*MAX_PATH
+
+void iDebuggerPipe(_In_ LPCTSTR lpOutputString, ...)
+{
+	va_list args;
+
+	va_start(args, lpOutputString);
+
+	CHAR DebuggerLine[BUFFER_SIZE];
+
+	memset(DebuggerLine, 0, sizeof(DebuggerLine));
+
+	const char prefix[] = "BREAK:";
+
+	memcpy(DebuggerLine, prefix, sizeof(prefix) - 1);
+
+	int Length = _pipe_sprintf(NULL, lpOutputString, args) + sizeof(prefix);
+
+	if (!Length || Length >= BUFFER_SIZE)
+		return;
+
+	_pipe_sprintf(DebuggerLine + (sizeof(prefix) - 1), lpOutputString, args);
+
+	char *Character = DebuggerLine;
+	while (*Character)
+	{   // Restrict to ASCII range
+		if (*Character < 0x0a || *Character > 0x7E)
+			*Character = 0x3F;  // '?'
+		Character++;
+	}
+
+	CallNamedPipe(SOLO_PIPE, DebuggerLine, Length, DebuggerLine, Length, (unsigned long*)&Length, NMPWAIT_WAIT_FOREVER);
+
+	// process console reply in DebuggerLine
+
+	va_end(args);
+
+	return;
+}
+
+BOOL InteractiveBreakpointCallback(PBREAKPOINTINFO pBreakpointInfo, struct _EXCEPTION_POINTERS* ExceptionInfo)
+{
+	PVOID CIP;
+	_DecodeType DecodeType;
+	_DecodeResult Result;
+	_OffsetType Offset = 0;
+	_DecodedInst DecodedInstruction;
+	unsigned int DecodedInstructionsCount = 0;
+	BOOL StepOver = FALSE, ForceStepOver = FALSE;
+
+	StopTrace = FALSE;
+
+	BreakpointsHit = TRUE;
+
+#ifdef _WIN64
+	CIP = (PVOID)ExceptionInfo->ContextRecord->Rip;
+	DecodeType = Decode64Bits;
+#else
+	CIP = (PVOID)ExceptionInfo->ContextRecord->Eip;
+	DecodeType = Decode32Bits;
+#endif
+
+	if (CIP)
+		Result = distorm_decode(Offset, (const unsigned char*)CIP, CHUNKSIZE, DecodeType, &DecodedInstruction, 1, &DecodedInstructionsCount);
+
+#ifdef _WIN64
+	iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", CIP, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
+#else
+	iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", (unsigned int)CIP, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
+#endif
+
+
+	LastContext = *ExceptionInfo->ContextRecord;
 
 	return TRUE;
 }

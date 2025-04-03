@@ -195,6 +195,9 @@ struct _g_config {
 	// Enable debugger
 	int debugger;
 
+	// Enable interactive debugger (CAPEsolo)
+	int idbg;
+
 	// Fake RDTSC
 	int fake_rdtsc;
 

@@ -55,7 +55,7 @@ static int _pipe_unicode(char **out, const wchar_t *s, int len)
 	return ret;
 }
 
-static int _pipe_sprintf(char *out, const char *fmt, va_list args)
+int _pipe_sprintf(char *out, const char *fmt, va_list args)
 {
 	int ret = 0;
 	while (*fmt != 0) {
