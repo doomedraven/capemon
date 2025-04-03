@@ -2588,16 +2588,7 @@ void iDebuggerPipe(_In_ LPCTSTR lpOutputString, ...)
 
 	memset(DebuggerLine, 0, sizeof(DebuggerLine));
 
-	const char prefix[] = "BREAK:";
-
-	memcpy(DebuggerLine, prefix, sizeof(prefix) - 1);
-
-	int Length = _pipe_sprintf(NULL, lpOutputString, args) + sizeof(prefix);
-
-	if (!Length || Length >= BUFFER_SIZE)
-		return;
-
-	_pipe_sprintf(DebuggerLine + (sizeof(prefix) - 1), lpOutputString, args);
+	_snprintf_s(DebuggerLine, BUFFER_SIZE, _TRUNCATE, "BREAK: %s", lpOutputString);
 
 	char *Character = DebuggerLine;
 	while (*Character)
@@ -2606,6 +2597,8 @@ void iDebuggerPipe(_In_ LPCTSTR lpOutputString, ...)
 			*Character = 0x3F;  // '?'
 		Character++;
 	}
+
+	int Length = (int)strlen(DebuggerLine);
 
 	CallNamedPipe(SOLO_PIPE, DebuggerLine, Length, DebuggerLine, Length, (unsigned long*)&Length, NMPWAIT_WAIT_FOREVER);
 
@@ -2646,7 +2639,6 @@ BOOL InteractiveBreakpointCallback(PBREAKPOINTINFO pBreakpointInfo, struct _EXCE
 #else
 	iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", (unsigned int)CIP, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
 #endif
-
 
 	LastContext = *ExceptionInfo->ContextRecord;
 
@@ -2832,7 +2824,12 @@ BOOL SetInitialBreakpoints(PVOID ImageBase)
 			// break-on-entrypoint uses bp0
 			Register = EntryPointRegister - 1;
 
-			if (SetBreakpoint(Register, 0, (BYTE*)EntryPoint, BP_EXEC, 1, BreakpointCallback))
+			PVOID Callback = BreakpointCallback;
+
+			if (g_config.idbg)
+				Callback = InteractiveBreakpointCallback;
+
+			if (SetBreakpoint(Register, 0, (BYTE*)EntryPoint, BP_EXEC, 1, Callback))
 			{
 				DebuggerOutput("Breakpoint %d set on entry point at 0x%p\n", Register, EntryPoint);
 				BreakpointsSet = TRUE;
