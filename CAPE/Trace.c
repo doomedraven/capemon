@@ -70,7 +70,9 @@ LARGE_INTEGER LastTimestamp;
 FILETIME LastTime;
 
 BOOL Trace(struct _EXCEPTION_POINTERS* ExceptionInfo);
+BOOL InteractiveTrace(struct _EXCEPTION_POINTERS* ExceptionInfo);
 BOOL BreakpointCallback(PBREAKPOINTINFO pBreakpointInfo, struct _EXCEPTION_POINTERS* ExceptionInfo);
+BOOL InteractiveBreakpointCallback(PBREAKPOINTINFO pBreakpointInfo, struct _EXCEPTION_POINTERS* ExceptionInfo);
 
 BOOL DoSetSingleStepMode(int Register, PCONTEXT Context, PVOID Handler)
 {
@@ -186,6 +188,7 @@ SIZE_T StrTestW(PWCHAR StrCandidate, PWCHAR OutputBuffer, SIZE_T BufferSize)
 #endif
 		return 0;
 	}
+
 	PWCHAR Character = (PWCHAR)OutputBuffer;
 	Count = 0;
 	while (*Character)
@@ -2578,19 +2581,23 @@ BOOL SoftwareBreakpointCallback(struct _EXCEPTION_POINTERS* ExceptionInfo)
 #define SOLO_PIPE "\\\\.\\pipe\\debugger_pipe"
 #define BUFFER_SIZE 2*MAX_PATH
 
-void iDebuggerPipe(_In_ LPCTSTR lpOutputString, ...)
+char* iDebuggerPipe(_In_ LPCTSTR lpOutputString, ...)
 {
 	va_list args;
-
 	va_start(args, lpOutputString);
 
 	CHAR DebuggerLine[BUFFER_SIZE];
+	static CHAR DebuggerCommand[BUFFER_SIZE];
+	CHAR TempBuffer[BUFFER_SIZE];
 
 	memset(DebuggerLine, 0, sizeof(DebuggerLine));
+	memset(TempBuffer, 0, sizeof(TempBuffer));
 
-	_snprintf_s(DebuggerLine, BUFFER_SIZE, _TRUNCATE, "BREAK: %s", lpOutputString);
+	_vsnprintf_s(TempBuffer, BUFFER_SIZE, _TRUNCATE, lpOutputString, args);
+	_snprintf_s(DebuggerLine, BUFFER_SIZE, _TRUNCATE, "BREAK:%s", TempBuffer);
 
-	char *Character = DebuggerLine;
+
+	char* Character = DebuggerLine;
 	while (*Character)
 	{   // Restrict to ASCII range
 		if (*Character < 0x0a || *Character > 0x7E)
@@ -2600,28 +2607,129 @@ void iDebuggerPipe(_In_ LPCTSTR lpOutputString, ...)
 
 	int Length = (int)strlen(DebuggerLine);
 
-	CallNamedPipe(SOLO_PIPE, DebuggerLine, Length, DebuggerLine, Length, (unsigned long*)&Length, NMPWAIT_WAIT_FOREVER);
-
-	// process console reply in DebuggerLine
+	CallNamedPipe(SOLO_PIPE, DebuggerLine, Length, DebuggerCommand, Length, (unsigned long*)&Length, NMPWAIT_WAIT_FOREVER);
 
 	va_end(args);
 
-	return;
+	return DebuggerCommand;
 }
 
-BOOL InteractiveBreakpointCallback(PBREAKPOINTINFO pBreakpointInfo, struct _EXCEPTION_POINTERS* ExceptionInfo)
+char* iOuputRegisters(PCONTEXT Context)
 {
-	PVOID CIP;
+	static char outputBuffer[2048];
+	char flagsBuffer[512];
+
+	memset(outputBuffer, 0, sizeof(outputBuffer));
+	memset(flagsBuffer, 0, sizeof(flagsBuffer));
+
+#ifdef _WIN64
+	// Bit masks for EFLAGS:
+	// CF: bit 0, PF: bit 2, AF: bit 4, ZF: bit 6, SF: bit 7,
+	// TF: bit 8, IF: bit 9, DF: bit 10, OF: bit 11,
+	// IOPL: bits 12-13, NT: bit 14, RF: bit 16,
+	// VM: bit 17, AC: bit 18, VIF: bit 19, VIP: bit 20, ID: bit 21.
+	_snprintf_s(flagsBuffer, sizeof(flagsBuffer), _TRUNCATE,
+		"CF: %d  PF: %d  AF: %d  ZF: %d  SF: %d\n"
+		"TF: %d  IF: %d  DF: %d  OF: %d  IOPL: %d\n"
+		"NT: %d  RF: %d  VM: %d  AC: %d  VIF: %d  VIP: %d  ID: %d",
+		(Context->EFlags & 0x00000001) ? 1 : 0,                     // CF
+		(Context->EFlags & 0x00000004) ? 1 : 0,                     // PF
+		(Context->EFlags & 0x00000010) ? 1 : 0,                     // AF
+		(Context->EFlags & 0x00000040) ? 1 : 0,                     // ZF
+		(Context->EFlags & 0x00000080) ? 1 : 0,                     // SF
+		(Context->EFlags & 0x00000100) ? 1 : 0,                     // TF
+		(Context->EFlags & 0x00000200) ? 1 : 0,                     // IF
+		(Context->EFlags & 0x00000400) ? 1 : 0,                     // DF
+		(Context->EFlags & 0x00000800) ? 1 : 0,                     // OF
+		(Context->EFlags >> 12) & 0x3,                              // IOPL (2 bits)
+		(Context->EFlags & 0x00004000) ? 1 : 0,                     // NT
+		(Context->EFlags & 0x00010000) ? 1 : 0,                     // RF
+		(Context->EFlags & 0x00020000) ? 1 : 0,                     // VM
+		(Context->EFlags & 0x00040000) ? 1 : 0,                     // AC
+		(Context->EFlags & 0x00080000) ? 1 : 0,                     // VIF
+		(Context->EFlags & 0x00100000) ? 1 : 0,                     // VIP
+		(Context->EFlags & 0x00200000) ? 1 : 0                      // ID
+	);
+
+	_snprintf_s(outputBuffer, sizeof(outputBuffer), _TRUNCATE,
+		"RAX: %#I64x\n"
+		"RBX: %#I64x\n"
+		"RCX: %#I64x\n"
+		"RDX: %#I64x\n"
+		"RSI: %#I64x\n"
+		"RDI: %#I64x\n"
+		"RSP: %#I64x\n"
+		"*RSP: %#I64x\n"
+		"RBP: %#I64x\n"
+		"R8 : %#I64x\n"
+		"R9 : %#I64x\n"
+		"R10: %#I64x\n"
+		"R11: %#I64x\n"
+		"R12: %#I64x\n"
+		"R13: %#I64x\n"
+		"R14: %#I64x\n"
+		"R15: %#I64x\n\n"
+		"EFLAGS:\n%s\n\n"
+		"Xmm0.Low: %#I64x\n"
+		"Xmm0.High: %#I64x\n"
+		"Xmm1.Low: %#I64x\n"
+		"Xmm1.High: %#I64x",
+		Context->Rax, Context->Rbx, Context->Rcx, Context->Rdx,
+		Context->Rsi, Context->Rdi, Context->Rsp, *(QWORD*)Context->Rsp,
+		Context->Rbp, Context->R8, Context->R9, Context->R10,
+		Context->R11, Context->R12, Context->R13, Context->R14,
+		Context->R15,
+		flagsBuffer,
+		Context->Xmm0.Low, Context->Xmm0.High,
+		Context->Xmm1.Low, Context->Xmm1.High);
+#else
+	_snprintf_s(flagsBuffer, sizeof(flagsBuffer), _TRUNCATE,
+		"CF: %d  PF: %d  AF: %d  ZF: %d  SF: %d\n"
+		"TF: %d  IF: %d  DF: %d  OF: %d  IOPL: %d\n"
+		"NT: %d  RF: %d",
+		(Context->EFlags & 0x00000001) ? 1 : 0,     // CF
+		(Context->EFlags & 0x00000004) ? 1 : 0,     // PF
+		(Context->EFlags & 0x00000010) ? 1 : 0,     // AF
+		(Context->EFlags & 0x00000040) ? 1 : 0,     // ZF
+		(Context->EFlags & 0x00000080) ? 1 : 0,     // SF
+		(Context->EFlags & 0x00000100) ? 1 : 0,     // TF
+		(Context->EFlags & 0x00000200) ? 1 : 0,     // IF
+		(Context->EFlags & 0x00000400) ? 1 : 0,     // DF
+		(Context->EFlags & 0x00000800) ? 1 : 0,     // OF
+		(Context->EFlags >> 12) & 0x3,              // IOPL
+		(Context->EFlags & 0x00004000) ? 1 : 0,     // NT
+		(Context->EFlags & 0x00010000) ? 1 : 0      // RF
+	);
+
+	_snprintf_s(outputBuffer, sizeof(outputBuffer), _TRUNCATE,
+		"EAX0x%x\n"
+		"EBX: 0x%x\n"
+		"ECX: 0x%x\n"
+		"EDX: 0x%x\n"
+		"ESI: 0x%x\n"
+		"EDI: 0x%x\n"
+		"ESP: 0x%x\n"
+		"*ESP: 0x%x\n"
+		"EBP: 0x%x\n\n"
+		"EFLAGS:\n%s",
+		Context->Eax, Context->Ebx, Context->Ecx, Context->Edx,
+		Context->Esi, Context->Edi, Context->Esp, *(DWORD*)Context->Esp,
+		Context->Ebp,
+		flagsBuffer);
+#endif
+
+	return iDebuggerPipe("%s", outputBuffer);
+}
+
+void InteractiveCommandHandler(struct _EXCEPTION_POINTERS* ExceptionInfo, char* command)
+{
 	_DecodeType DecodeType;
 	_DecodeResult Result;
 	_OffsetType Offset = 0;
 	_DecodedInst DecodedInstruction;
 	unsigned int DecodedInstructionsCount = 0;
-	BOOL StepOver = FALSE, ForceStepOver = FALSE;
-
-	StopTrace = FALSE;
-
-	BreakpointsHit = TRUE;
+	PVOID CIP;
+	BOOL Done = FALSE;
 
 #ifdef _WIN64
 	CIP = (PVOID)ExceptionInfo->ContextRecord->Rip;
@@ -2631,16 +2739,105 @@ BOOL InteractiveBreakpointCallback(PBREAKPOINTINFO pBreakpointInfo, struct _EXCE
 	DecodeType = Decode32Bits;
 #endif
 
-	if (CIP)
-		Result = distorm_decode(Offset, (const unsigned char*)CIP, CHUNKSIZE, DecodeType, &DecodedInstruction, 1, &DecodedInstructionsCount);
+	Result = distorm_decode(Offset, (const unsigned char*)CIP, CHUNKSIZE, DecodeType, &DecodedInstruction, 1, &DecodedInstructionsCount);
 
-#ifdef _WIN64
-	iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", CIP, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
-#else
-	iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", (unsigned int)CIP, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
-#endif
+	if (!DecodedInstruction.size)
+		return;
 
 	LastContext = *ExceptionInfo->ContextRecord;
+
+	PVOID ReturnAddress = (PVOID)((PUCHAR)CIP + DecodedInstruction.size);
+
+	while (!Done)
+	{
+		Sleep(100);
+		switch (command[0])
+		{
+		case 'I':
+			// Return bp instruction
+#ifdef _WIN64
+			command = iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", CIP, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
+#else
+			command = iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", (unsigned int)CIP, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
+#endif
+			break;
+		case 'R':
+			// Registers
+			command = iOuputRegisters(&LastContext);
+			break;
+		case 'C':
+			// Continue
+			Done = TRUE;
+			break;
+		case 'S':
+			// Step in
+			SetSingleStepMode(ExceptionInfo->ContextRecord, InteractiveTrace);
+			break;
+		case 'O':
+			// Step over
+			if (ContextSetNextAvailableBreakpoint(ExceptionInfo->ContextRecord, &StepOverRegister, 0, (BYTE*)ReturnAddress, BP_EXEC, 1, InteractiveBreakpointCallback))
+			{
+#ifdef DEBUG_COMMENTS
+				DebugOutput("InteractiveCommandHandler: Set breakpoint on return address 0x%p (step-over register %d)\n", ReturnAddress, StepOverRegister);
+#endif
+				LastContext = *ExceptionInfo->ContextRecord;
+				ClearSingleStepMode(ExceptionInfo->ContextRecord);
+				ReturnAddress = NULL;
+				return;
+			}
+			else
+				DebugOutput("InteractiveCommandHandler: Failed to set breakpoint on return address 0x%p\n", ReturnAddress);
+			break;
+		case 'N':
+			// Return next instruction
+				Result = distorm_decode(Offset, (const unsigned char*)ReturnAddress, CHUNKSIZE, DecodeType, &DecodedInstruction, 1, &DecodedInstructionsCount);
+				if (!DecodedInstruction.size)
+				{
+					DebugOutput("InteractiveCommandHandler: Failed to disassemble next instruction at address 0x%p\n", ReturnAddress);
+					return;
+				}
+#ifdef _WIN64
+				command = iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", ReturnAddress, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
+#else
+				command = iDebuggerPipe("0x%p  %-24s %-6s%-4s%-30s", (unsigned int)ReturnAddress, (char*)_strupr(DecodedInstruction.instructionHex.p), DecodedInstruction.mnemonic.p, DecodedInstruction.operands.length != 0 ? " " : "", DecodedInstruction.operands.p);
+#endif
+			break;
+		case 'H':
+			// Get breakpoint address
+			command = iDebuggerPipe("Break at: 0x%p", CIP);
+			break;
+		default:
+			// Invalid command
+			command = iDebuggerPipe("Invalid command: %s", command);
+			break;
+		}
+	}
+}
+
+BOOL InteractiveTrace(struct _EXCEPTION_POINTERS* ExceptionInfo)
+{
+	char* command = NULL;
+
+	InteractiveCommandHandler(ExceptionInfo, command);
+
+	return TRUE;
+}
+
+BOOL InteractiveBreakpointCallback(PBREAKPOINTINFO pBreakpointInfo, struct _EXCEPTION_POINTERS* ExceptionInfo)
+{
+	PVOID CIP;
+	char* command = NULL;
+
+#ifdef _WIN64
+	CIP = (PVOID)ExceptionInfo->ContextRecord->Rip;
+#else
+	CIP = (PVOID)ExceptionInfo->ContextRecord->Eip;
+#endif
+
+	// Return breakpoint address
+	command = iDebuggerPipe("Breakpoint: %i => 0x%p", pBreakpointInfo->Register, CIP);
+
+	InteractiveCommandHandler(ExceptionInfo, command);
 
 	return TRUE;
 }
