@@ -1557,8 +1557,6 @@ HOOKDEF_NOTAIL(WINAPI, NtRaiseException,
 	return 0;
 }
 
-BOOL EnableFakeCount;
-
 HOOKDEF(UINT, WINAPI, GetWriteWatch,
 	__in		DWORD		dwFlags,
 	__in		PVOID		lpBaseAddress,
@@ -1569,14 +1567,14 @@ HOOKDEF(UINT, WINAPI, GetWriteWatch,
 ) {
 	UINT ret = Old_GetWriteWatch(dwFlags, lpBaseAddress, dwRegionSize, lpAddresses, lpdwCount, lpdwGranularity);
 	LOQ_zero("process", "phiL", "BaseAddress", lpBaseAddress, "RegionSize", dwRegionSize, "Flags", dwFlags, "Count", lpdwCount);
-#ifndef _WIN64
+
 	// For Pikabot detonation, e.g. 2ebf4db49a8a7875e9c443482f82af1febd9751eee65be155355c3525331ae88
 	// ref https://github.com/BaumFX/cpp-anti-debug/blob/d6e84a09b21593a65a5d7545e0d3df876cb0a29a/anti_debug.cpp#L260
-	if (ret)
-		EnableFakeCount = TRUE;
-	else if (EnableFakeCount && lpdwCount && *lpdwCount == 1)
+	if (ret == 0 && lpdwCount && *lpdwCount == 1) {
+		// Overwrite the single dirty page write-watch count to 0.
+		// This perfectly masks the single-page touch made by capemon's own hook-logging inspection.
 		*lpdwCount = 0;
-#endif
+	}
 	return ret;
 }
 
