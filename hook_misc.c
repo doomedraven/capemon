@@ -2122,7 +2122,10 @@ static BOOL IsWriteWatchBuffer(PVOID Buffer, SIZE_T Size)
 		return FALSE;
 
 	// Verify entire buffer range fits within single contiguous allocation
-	if ((ULONG_PTR)Buffer + Size > (ULONG_PTR)mbi.AllocationBase + mbi.RegionSize)
+	// Check: Buffer + Size <= AllocationBase + RegionSize (end of buffer <= end of allocation)
+	ULONG_PTR buffer_end = (ULONG_PTR)Buffer + Size;
+	ULONG_PTR allocation_end = (ULONG_PTR)mbi.AllocationBase + mbi.RegionSize;
+	if (buffer_end > allocation_end)
 		return FALSE;
 
 	// Detect WriteWatch by attempting GetWriteWatch on the region
