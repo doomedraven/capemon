@@ -2107,3 +2107,73 @@ HOOKDEF(HANDLE, WINAPI, SetClipboardData,
 	LOQ_handle("misc", "i", "Format", uFormat);
 	return ret;
 }
+
+// WriteWatch write-interception for unpacking capture
+// Strategy: Intercept memory writes to WriteWatch-tracked buffers to capture unpacked PE
+// without reading the buffer directly (which would mark pages dirty in WriteWatch)
+
+static BOOL IsWriteWatchBuffer(PVOID Buffer, SIZE_T Size)
+{
+	if (!Buffer || !Size)
+		return FALSE;
+
+	MEMORY_BASIC_INFORMATION mbi;
+	if (!VirtualQuery(Buffer, &mbi, sizeof(mbi)))
+		return FALSE;
+
+	// Verify entire buffer range fits within single contiguous allocation
+	if ((ULONG_PTR)Buffer + Size > (ULONG_PTR)mbi.AllocationBase + mbi.RegionSize)
+		return FALSE;
+
+	// Detect WriteWatch by attempting GetWriteWatch on the region
+	// WriteWatch allocations allow GetWriteWatch queries; non-WriteWatch allocations fail with STATUS_INVALID_PARAMETER
+	ULONG_PTR dummy_address;
+	ULONG dummy_count = 1;
+	ULONG dummy_granularity;
+	UINT result = GetWriteWatch(0, Buffer, mbi.RegionSize, &dummy_address, &dummy_count, &dummy_granularity);
+
+	// STATUS_SUCCESS (0) or GetWriteWatch succeeding indicates this region was allocated with MEM_WRITE_WATCH
+	return (result == 0);
+}
+
+HOOKDEF(PVOID, NTAPI, RtlMoveMemory,
+	__out       PVOID       Destination,
+	__in  const VOID        *Source,
+	__in        SIZE_T      Length
+) {
+	Old_RtlMoveMemory(Destination, Source, Length);
+
+	// Intercept moves to WriteWatch buffers for unpacking capture
+	if (Length > 0 && IsWriteWatchBuffer(Destination, Length)) {
+		if (g_config.unpacker) {
+			// Dump potential unpacked code being moved to WriteWatch region
+			if (DumpMemory(Destination, Length) == 1) {
+				DebugOutput("WriteWatch unpack capture: Dumped %zu bytes from RtlMoveMemory destination 0x%p\n", Length, Destination);
+			}
+		}
+	}
+
+	LOQ_zero("misc", "ppi", "Destination", Destination, "Source", Source, "Length", Length);
+	return Destination;
+}
+
+HOOKDEF(PVOID, NTAPI, memcpy,
+	__out       PVOID       Destination,
+	__in  const VOID        *Source,
+	__in        size_t      Count
+) {
+	PVOID ret = Old_memcpy(Destination, Source, Count);
+
+	// Intercept copies to WriteWatch buffers for unpacking capture
+	if (Count > 0 && IsWriteWatchBuffer(Destination, Count)) {
+		if (g_config.unpacker) {
+			// Dump potential unpacked code being written to WriteWatch region
+			if (DumpMemory(Destination, Count) == 1) {
+				DebugOutput("WriteWatch unpack capture: Dumped %zu bytes from memcpy destination 0x%p\n", Count, Destination);
+			}
+		}
+	}
+
+	LOQ_zero("misc", "ppi", "Destination", Destination, "Source", Source, "Count", Count);
+	return ret;
+}
