@@ -667,9 +667,6 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 		// initialise CAPE
 		CAPE_init();
 
-		// adds our own DLL range as well, since the hiding is done later
-		add_all_dlls_to_dll_ranges();
-
 		
 #ifdef _WIN64
 		if (!is_64bit_os) {
@@ -689,6 +686,9 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 			LoadLibraryW(L"bcrypt.dll");
 		}
 #endif
+
+		// adds our own DLL range as well, since the hiding is done later
+		add_all_dlls_to_dll_ranges();
 
 		// initialize all hooks
 		set_hooks();
