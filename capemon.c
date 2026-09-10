@@ -565,6 +565,20 @@ extern CRITICAL_SECTION readfile_critsec, g_mutex, g_writing_log_buffer_mutex, g
 BOOLEAN g_dll_main_complete;
 OSVERSIONINFOA g_osverinfo;
 
+static BOOL is_wow64_process(void)
+{
+#ifdef _WIN64
+	ULONG_PTR wow64_peb = 0;
+	ULONG ret_len = 0;
+	if (NT_SUCCESS(NtQueryInformationProcess(GetCurrentProcess(), ProcessWow64Information, &wow64_peb, sizeof(wow64_peb), &ret_len))) {
+		return (wow64_peb != 0);
+	}
+	return FALSE;
+#else
+	return TRUE;
+#endif
+}
+
 BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 {
 	lasterror_t lasterror;
@@ -669,7 +683,7 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 
 		
 #ifdef _WIN64
-		if (!is_64bit_os) {
+		if (!is_wow64_process()) {
 			// We are in a native 64-bit process (NOT WoW64).
 			// Eagerly resolve the delayed DLLs so they are present in memory 
 			// before set_hooks() iterates and attempts to hook them via GetModuleHandle.
