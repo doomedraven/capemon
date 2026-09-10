@@ -670,6 +670,26 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 		// adds our own DLL range as well, since the hiding is done later
 		add_all_dlls_to_dll_ranges();
 
+		
+#ifdef _WIN64
+		if (!is_64bit_os) {
+			// We are in a native 64-bit process (NOT WoW64).
+			// Eagerly resolve the delayed DLLs so they are present in memory 
+			// before set_hooks() iterates and attempts to hook them via GetModuleHandle.
+			LoadLibraryW(L"advapi32.dll");
+			LoadLibraryW(L"user32.dll");
+			LoadLibraryW(L"ws2_32.dll");
+			LoadLibraryW(L"crypt32.dll");
+			LoadLibraryW(L"shlwapi.dll");
+			LoadLibraryW(L"ole32.dll");
+			LoadLibraryW(L"shell32.dll");
+			LoadLibraryW(L"setupapi.dll");
+			LoadLibraryW(L"oleaut32.dll");
+			LoadLibraryW(L"netapi32.dll");
+			LoadLibraryW(L"bcrypt.dll");
+		}
+#endif
+
 		// initialize all hooks
 		set_hooks();
 
