@@ -652,12 +652,10 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 			add_protected_pid(pids[i]);
 		}
 
-		hkcu_init();
-
+		
 		// initialize the log file
 		if (!g_config.tlsdump)
-			log_init(g_config.debug || g_config.standalone);
-
+			
 		// initialize the Sleep() skipping stuff
 		init_sleep_skip(g_config.first_process);
 
@@ -682,24 +680,6 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 		CAPE_init();
 
 		
-#ifdef _WIN64
-		if (!is_wow64_process()) {
-			// We are in a native 64-bit process (NOT WoW64).
-			// Eagerly resolve the delayed DLLs so they are present in memory 
-			// before set_hooks() iterates and attempts to hook them via GetModuleHandle.
-			LoadLibraryW(L"advapi32.dll");
-			LoadLibraryW(L"user32.dll");
-			LoadLibraryW(L"ws2_32.dll");
-			LoadLibraryW(L"crypt32.dll");
-			LoadLibraryW(L"shlwapi.dll");
-			LoadLibraryW(L"ole32.dll");
-			LoadLibraryW(L"shell32.dll");
-			LoadLibraryW(L"setupapi.dll");
-			LoadLibraryW(L"oleaut32.dll");
-			LoadLibraryW(L"netapi32.dll");
-			LoadLibraryW(L"bcrypt.dll");
-		}
-#endif
 
 		// adds our own DLL range as well, since the hiding is done later
 		add_all_dlls_to_dll_ranges();

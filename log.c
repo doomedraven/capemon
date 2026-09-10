@@ -1445,8 +1445,12 @@ void log_hook_restoration(const hook_t *h)
 DWORD g_log_thread_id;
 DWORD g_logwatcher_thread_id;
 
+
+volatile LONG g_log_initialized = 0;
 void log_init(int debug)
 {
+	if (InterlockedCompareExchange(&g_log_initialized, 1, 0) != 0) return;
+
 	g_buffer = calloc(1, BUFFERSIZE);
 
 	g_log_flush = CreateEvent(NULL, FALSE, FALSE, NULL);

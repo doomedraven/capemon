@@ -1648,6 +1648,7 @@ wchar_t *get_key_path(POBJECT_ATTRIBUTES ObjectAttributes, PKEY_NAME_INFORMATION
 	}
 
 normal:
+	if (!g_hkcu.hkcu_string) hkcu_init();
 	if (!wcsnicmp(keybuf->KeyName, g_hkcu.hkcu_string, g_hkcu.len) && (keybuf->KeyName[g_hkcu.len] == L'\\' || keybuf->KeyName[g_hkcu.len] == L'\0')) {
 		unsigned int ourlen = lstrlenW(L"HKEY_CURRENT_USER");
 		memcpy(keybuf->KeyName, L"HKEY_CURRENT_USER", ourlen * sizeof(WCHAR));
@@ -1711,10 +1712,15 @@ static PSID GetSID(void)
 	return NULL;
 }
 
+
+static volatile LONG g_hkcu_initialized = 0;
 void hkcu_init(void)
 {
+	if (InterlockedCompareExchange(&g_hkcu_initialized, 1, 0) != 0) return;
+
 	PSID sid = GetSID();
 	LPWSTR sidstr;
+
 
 	ConvertSidToStringSidW(sid, &sidstr);
 
