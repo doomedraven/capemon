@@ -50,7 +50,20 @@ HANDLE g_log_handle;
 
 // current to-be-logged API call
 // Thread-local context structure - includes BSON state + active serializer pointer
-#define THREAD_LOG_RING_SIZE (1024 * 512) // 512KB Ring per thread
+
+// Per-thread record ring. Every record is stored as a 4-byte little-endian
+// length header followed by the payload, padded up to a 4-byte boundary. A
+// length header of 0 is reserved as the "wrap to offset 0" marker, which is
+// why zero-length records are rejected by log_raw_direct().
+//
+// Both the size and every advance are multiples of 4, so write_idx and
+// read_idx are always 4-byte aligned. That invariant is what guarantees a
+// full 4-byte wrap marker always fits at write_idx without running off the
+// end of the buffer.
+#define THREAD_LOG_RING_SIZE (256 * 1024)
+#define RING_ALIGN(x) (((x) + 3u) & ~3u)
+
+#define LOGTBL_EXPLAINED_MAX 256
 
 typedef struct {
 	ULONG_PTR thread_id;
@@ -59,11 +72,11 @@ typedef struct {
 	log_serializer_t *active_serializer;  // Strategy pattern: BSON or Protobuf
 	protobuf_context_t *g_pb_ctx;
 
-	// SPSC offsets for the finished wire bytes
-	volatile ULONG write_idx; 
+	// SPSC offsets for the finished wire bytes. write_idx is owned by the
+	// logging thread, read_idx by whoever is draining.
+	volatile ULONG write_idx;
 	volatile ULONG read_idx;
-	ULONG buffer_size;
-	
+
 	// Lock-free deduplication state (replaces global lastlog_t)
 	unsigned char *last_buf;
 	unsigned int last_len;
@@ -75,8 +88,19 @@ typedef struct {
 	DWORD last_api_logged;
 	BOOLEAN special_api_triggered;
 	BOOLEAN delete_last_log;
-	
-	ULONG dropped_records; 
+
+	// Which log IDs this thread has already emitted an "explain" frame for.
+	// Deliberately per-thread rather than global: the result server requires
+	// explain(id) to reach the wire before the first record carrying that id,
+	// and the only ordering we can cheaply guarantee is FIFO within a single
+	// ring. A global flag would let thread A win the race, park explain(id)
+	// in its own ring, and leave thread B emitting record(id) into a ring
+	// that may drain first. The cost is a duplicate explain frame per thread
+	// per id, which the parser treats as an idempotent map update.
+	char explained[LOGTBL_EXPLAINED_MAX];
+
+	ULONG dropped_records;
+	ULONG dropped_reported;
 
 	// The encoded byte stream for the drain loop
 	unsigned char buffer[THREAD_LOG_RING_SIZE];
@@ -118,7 +142,10 @@ static thread_log_context_t* GetThreadLogContext(void) {
 	pCtx = (thread_log_context_t*)lookup_get(&g_log_contexts, tid, &size);
 	if (!pCtx) {
 		pCtx = (thread_log_context_t*)lookup_add(&g_log_contexts, tid, sizeof(thread_log_context_t));
+		if (!pCtx)
+			return NULL;
 		memset(pCtx, 0, sizeof(thread_log_context_t));
+		pCtx->thread_id = tid;
 		pCtx->active_serializer = g_default_serializer;
 	}
 
@@ -155,9 +182,25 @@ static __inline log_serializer_t *log_ctx_serializer(void) {
 #define g_istr (log_ctx_istr())
 #define g_active_serializer (log_ctx_serializer())
 
+static void drain_ring(thread_log_context_t *ring);
+static void log_raw_direct(const char *buf, size_t length);
+
 void TlsThreadCleanup(void) {
 	thread_log_context_t* pCtx = get_teb_context();
 	if (pCtx) {
+		// lookup_del() only unlinks the entry, so once it is off the list the
+		// drain walk can never reach this ring again. Anything still queued
+		// has to go out now or it is lost for the rest of the process.
+		if (pCtx->last_buf) {
+			log_raw_direct((const char *)pCtx->last_buf, pCtx->last_len);
+			free(pCtx->last_buf);
+			pCtx->last_buf = NULL;
+		}
+
+		EnterCriticalSection(&g_writing_log_buffer_mutex);
+		drain_ring(pCtx);
+		LeaveCriticalSection(&g_writing_log_buffer_mutex);
+
 		free(pCtx->g_pb_ctx);
 		pCtx->g_pb_ctx = NULL;
 		set_teb_context(NULL);
@@ -291,7 +334,7 @@ log_serializer_t g_bson_serializer = {
 	.destroy = bson_serializer_destroy
 };
 
-static LONG logtbl_explained[256] = {0};
+// Explain-frame tracking now lives per-thread in thread_log_context_t::explained.
 
 #define LOG_ID_PROCESS 0
 #define LOG_ID_THREAD 1
@@ -318,53 +361,99 @@ static HANDLE g_log_flush;
 
 extern int process_shutting_down;
 
-static void _send_log(void)
+static void _send_log(BOOL blocking);
+
+// Writes the whole span or reports failure. WriteFile on a byte-mode pipe is
+// allowed to accept less than requested; the previous global-buffer code
+// handled that with a memmove, and the ring has to handle it too or a short
+// write silently truncates a BSON document and desynchronises the stream.
+static BOOL write_all(const unsigned char *buf, ULONG length)
 {
-	if (!TryEnterCriticalSection(&g_writing_log_buffer_mutex)) return;
+	HANDLE h;
+	ULONG off = 0;
 
-	entry_t *pItem = (entry_t *)g_log_contexts.root;
-	while (pItem != NULL) {
-		thread_log_context_t *ring = (thread_log_context_t *)pItem->data;
-		
-		ULONG read = ring->read_idx;
-		ULONG write = ring->write_idx;
-
-		while (read != write) {
-			ULONG length = *(ULONG*)&ring->buffer[read];
-			
-			if (length == 0) {
-				// Marker for wrap-around
-				read = 0;
-				if (read == write) break;
-				length = *(ULONG*)&ring->buffer[read];
-			}
-			
-			read += sizeof(ULONG);
-			
-			int written = -1;
-			if (g_sock == DEBUG_SOCKET) {
-				if (g_debug_log_handle != INVALID_HANDLE_VALUE) {
-					WriteFile(g_debug_log_handle, &ring->buffer[read], length, &written, NULL);
-				} else {
-					written = length;
-				}
-			} else {
-				if (g_log_handle != INVALID_HANDLE_VALUE) {
-					WriteFile(g_log_handle, &ring->buffer[read], length, &written, NULL);
-				}
-			}
-
-			if (written < 0) {
-				// Pipe failure or busy, abort drain for now
-				break;
-			}
-			
-			read += length;
-			if (read == THREAD_LOG_RING_SIZE) read = 0;
-			ring->read_idx = read;
-		}
-		pItem = pItem->next;
+	if (g_sock == DEBUG_SOCKET) {
+		h = g_debug_log_handle;
+		if (h == INVALID_HANDLE_VALUE)
+			return TRUE;   // non-admin debug case, discard
 	}
+	else {
+		h = g_log_handle;
+		if (h == INVALID_HANDLE_VALUE)
+			return FALSE;  // not connected yet, keep the record queued
+	}
+
+	while (off < length) {
+		DWORD written = 0;
+		if (!WriteFile(h, buf + off, length - off, &written, NULL))
+			return FALSE;
+		if (written == 0)
+			return FALSE;
+		off += written;
+	}
+	return TRUE;
+}
+
+// Drains one thread's ring. Only ever touches read_idx, so it stays SPSC-safe
+// against the owning thread's concurrent log_raw_direct().
+static void drain_ring(thread_log_context_t *ring)
+{
+	ULONG read = ring->read_idx;
+	ULONG write = *(volatile ULONG *)&ring->write_idx;
+
+	while (read != write) {
+		ULONG length = *(ULONG *)&ring->buffer[read];
+
+		if (length == 0) {
+			// Wrap marker: the tail of the buffer was too short for the next
+			// record. Commit the wrap before writing anything so a failed
+			// write below cannot leave read_idx parked on the marker.
+			read = 0;
+			ring->read_idx = read;
+			if (read == write)
+				break;
+			length = *(ULONG *)&ring->buffer[read];
+			if (length == 0)
+				break;  // defensive: two markers in a row is not reachable
+		}
+
+		if (!write_all(&ring->buffer[read + sizeof(ULONG)], length))
+			break;  // pipe stalled or not connected, retry on the next drain
+
+		read += (ULONG)sizeof(ULONG) + RING_ALIGN(length);
+		if (read >= THREAD_LOG_RING_SIZE)
+			read = 0;
+		ring->read_idx = read;
+	}
+}
+
+// blocking=FALSE is the periodic best-effort drain from the logging thread.
+// blocking=TRUE is used by log_flush() and thread teardown, where skipping the
+// drain means losing records outright.
+static void _send_log(BOOL blocking)
+{
+	entry_t *pItem;
+
+	if (blocking)
+		EnterCriticalSection(&g_writing_log_buffer_mutex);
+	else if (!TryEnterCriticalSection(&g_writing_log_buffer_mutex))
+		return;
+
+	for (pItem = (entry_t *)g_log_contexts.root; pItem != NULL; pItem = pItem->next) {
+		thread_log_context_t *ring = (thread_log_context_t *)pItem->data;
+
+		drain_ring(ring);
+
+		// Surface backpressure losses rather than dropping them silently.
+		// Reported on the command pipe, not the log pipe, so this cannot
+		// recurse back into the ring being drained.
+		if (ring->dropped_records != ring->dropped_reported) {
+			ring->dropped_reported = ring->dropped_records;
+			pipe("CRITICAL:Log ring overflow, thread %d dropped %d records",
+				(int)ring->thread_id, (int)ring->dropped_records);
+		}
+	}
+
 	LeaveCriticalSection(&g_writing_log_buffer_mutex);
 }
 
@@ -374,7 +463,7 @@ static DWORD WINAPI _log_thread(LPVOID param)
 
 	while (1) {
 		WaitForSingleObject(g_log_flush, 500);
-		_send_log();
+		_send_log(FALSE);
 	}
 }
 
@@ -395,39 +484,64 @@ extern BOOLEAN g_dll_main_complete;
 
 static void log_raw_direct(const char *buf, size_t length) {
 	thread_log_context_t *ring = GetThreadLogContext();
-	if (!ring) return;
+	ULONG write, read, used, freeb, need, pad;
 
-	ULONG write = ring->write_idx;
-	ULONG read = ring->read_idx;
-	
-	ULONG free_space;
-	if (read > write) {
-		free_space = read - write - 1;
-	} else {
-		free_space = THREAD_LOG_RING_SIZE - write + read - 1;
-	}
+	if (!ring)
+		return;
 
-	if (length + sizeof(ULONG) > free_space) {
+	// A zero length header is the wrap marker, so it cannot also be a record.
+	if (length == 0)
+		return;
+
+	write = ring->write_idx;
+	read = *(volatile ULONG *)&ring->read_idx;
+
+	// Record stride: 4-byte header + payload padded to the next 4-byte
+	// boundary. Keeping every stride aligned is what keeps write_idx aligned,
+	// which in turn guarantees a full 4-byte wrap marker always fits.
+	need = (ULONG)sizeof(ULONG) + RING_ALIGN((ULONG)length);
+
+	// If the record cannot fit in the tail, the tail is burned by a wrap
+	// marker. Those bytes are part of the cost of this record and have to be
+	// charged against free space, otherwise the write can overrun read_idx
+	// and corrupt records the drainer has not consumed yet.
+	pad = (THREAD_LOG_RING_SIZE - write < need) ? (THREAD_LOG_RING_SIZE - write) : 0;
+
+	used = (write >= read) ? (write - read) : (THREAD_LOG_RING_SIZE - read + write);
+	// One stride is held back so write_idx == read_idx always means empty.
+	freeb = THREAD_LOG_RING_SIZE - used - (ULONG)sizeof(ULONG);
+
+	if (pad + need > freeb) {
+		// Records larger than the ring itself can never be queued. Rather
+		// than drop them, drain what this thread has already queued and then
+		// write the record straight out, which preserves this thread's
+		// ordering. Anything else is transient backpressure, so drop and
+		// account for it.
+		if (need + (ULONG)sizeof(ULONG) > THREAD_LOG_RING_SIZE) {
+			EnterCriticalSection(&g_writing_log_buffer_mutex);
+			drain_ring(ring);
+			if (!write_all((const unsigned char *)buf, (ULONG)length))
+				ring->dropped_records++;
+			LeaveCriticalSection(&g_writing_log_buffer_mutex);
+			return;
+		}
 		ring->dropped_records++;
 		return;
 	}
 
-	ULONG contiguous_space = THREAD_LOG_RING_SIZE - write;
-	if (length + sizeof(ULONG) > contiguous_space) {
-		memset(&ring->buffer[write], 0, contiguous_space);
+	if (pad) {
+		*(ULONG *)&ring->buffer[write] = 0;
 		write = 0;
 	}
 
-	*(ULONG*)&ring->buffer[write] = (ULONG)length;
-	write += sizeof(ULONG);
+	*(ULONG *)&ring->buffer[write] = (ULONG)length;
+	memcpy(&ring->buffer[write + sizeof(ULONG)], buf, length);
 
-	memcpy(&ring->buffer[write], buf, length);
-	write += (ULONG)length;
-
-	if (write == THREAD_LOG_RING_SIZE) {
+	write += need;
+	if (write >= THREAD_LOG_RING_SIZE)
 		write = 0;
-	}
 
+	// Publish the payload before the index that makes it visible to the drainer.
 	MemoryBarrier();
 	ring->write_idx = write;
 }
@@ -440,8 +554,8 @@ void log_flush()
 		free(ctx->last_buf);
 		ctx->last_buf = NULL;
 	}
-	
-	_send_log();
+
+	_send_log(TRUE);
 }
 
 void debug_message(const char *msg) {
@@ -718,6 +832,7 @@ void loq(int index, const char *category, const char *name,
 	lasterror_t lasterror;
 	hook_info_t *hookinfo;
 	log_serializer_t *s = NULL;
+	thread_log_context_t *ctx;
 
 	if (index >= LOG_ID_PREDEFINED_MAX && g_config.suspend_logging)
 		return;
@@ -726,18 +841,20 @@ void loq(int index, const char *category, const char *name,
 
 	hook_disable();
 
-
+	ctx = GetThreadLogContext();
 
 	// The per-index "explain" frame is raw BSON metadata the result server uses
 	// to name argument positions. It has no protobuf equivalent, so in protobuf
 	// mode it must not be emitted - otherwise the stream is BSON frames
 	// interleaved with protobuf frames.
-	if (g_active_serializer == &g_bson_serializer &&
-		logtbl_explained[index] == 0) {
+	if (g_active_serializer == &g_bson_serializer && ctx &&
+		index >= 0 && index < LOGTBL_EXPLAINED_MAX &&
+		ctx->explained[index] == 0) {
 		const char * pname;
 		bson b[1];
 
-		if (InterlockedCompareExchange(&logtbl_explained[index], 1, 0) == 0) {
+		{
+			ctx->explained[index] = 1;
 
 			va_start(args, fmt);
 
@@ -879,21 +996,18 @@ void loq(int index, const char *category, const char *name,
 		}
 	}
 
-	// Consume the special-API state now, before serialization. Serialization
-	// runs outside g_mutex (into thread-local buffers), so leaving this at the
-	// tail (post-serialization) would let a concurrent loq() on another thread
-	// observe a stale special_api_triggered / last_api_logged, or free
-	// ctx->last_buf out from under the API that set_special_api() was meant for.
-	{
-		if (ctx) {
-			if (!ctx->special_api_triggered)
-				ctx->last_api_logged = API_OTHER;
-			else {
-				ctx->special_api_triggered = FALSE;
-				if (ctx->delete_last_log) {
-					free(ctx->last_buf);
-					ctx->last_buf = NULL;
-				}
+	// Consume the special-API state. This used to be global state guarded by
+	// g_mutex and was racy across threads; it now lives in the thread context
+	// alongside the dedup cache it controls, so set_special_api() and the
+	// loq() that consumes it are always the same thread.
+	if (ctx) {
+		if (!ctx->special_api_triggered)
+			ctx->last_api_logged = API_OTHER;
+		else {
+			ctx->special_api_triggered = FALSE;
+			if (ctx->delete_last_log) {
+				free(ctx->last_buf);
+				ctx->last_buf = NULL;
 			}
 		}
 	}
@@ -1317,7 +1431,7 @@ buffer_log:
 	}
 	else {
 		// Caching and duplicate-checking are exclusive to BSON formatting (due to Protobuf's frame encapsulation)
-		if (s == &g_bson_serializer) {
+		if (s == &g_bson_serializer && ctx) {
 			if (ctx->last_buf) {
 				// BSON documents are bounded by BUFFERSIZE (16 MB); the
 				// size_t -> unsigned int narrowing here is safe.
@@ -1350,7 +1464,6 @@ buffer_log:
 	}
 
 	s->destroy();
-exit:
 	if (g_config.force_flush == 2)
 		log_flush();
 
@@ -1362,9 +1475,17 @@ exit:
 void announce_netlog()
 {
 	char protoname[32];
-	sprintf(protoname, "BSON %u\n", GetCurrentProcessId());
+	int len = sprintf(protoname, "BSON %u\n", GetCurrentProcessId());
 	//sprintf(protoname+5, "logs/%lu.bson\n", GetCurrentProcessId());
-	log_raw_direct(protoname, strlen(protoname));
+
+	// This header has to be the very first thing the result server reads.
+	// It deliberately bypasses the per-thread rings: queued as a record it
+	// would just be one entry among many, and the drain walks threads in
+	// lookup order, so another thread's ring could reach the pipe first and
+	// the server would reject the stream from byte zero.
+	EnterCriticalSection(&g_writing_log_buffer_mutex);
+	write_all((const unsigned char *)protoname, (ULONG)len);
+	LeaveCriticalSection(&g_writing_log_buffer_mutex);
 }
 
 void log_new_process()
@@ -1630,8 +1751,6 @@ DWORD g_logwatcher_thread_id;
 
 void log_init(int debug)
 {
-	
-
 	g_log_flush = CreateEvent(NULL, FALSE, FALSE, NULL);
 
 	if (g_config.log_format == LOG_FORMAT_PROTOBUF) {
