@@ -108,7 +108,7 @@ static thread_log_context_t* GetThreadLogContext(void) {
 	if (get_teb_context() == NULL) {
 		set_teb_context(pCtx);
 	}
-	
+
 	return pCtx;
 }
 
@@ -702,12 +702,22 @@ void loq(int index, const char *category, const char *name,
 
 	hook_disable();
 
-	// Verify TLS context is available before proceeding
-	if (!GetThreadLogContext()) {
-		// TLS allocation failed - cannot log, exit gracefully
-		hook_enable();
-		set_lasterrors(&lasterror);
-		return;
+	if (!TryEnterCriticalSection(&g_mutex))
+	{
+		int retries = 100;
+		BOOL acquired = FALSE;
+
+		while (retries-- > 0) {
+			if (TryEnterCriticalSection(&g_mutex)) {
+				acquired = TRUE;
+				break;
+			}
+			SwitchToThread();
+		}
+
+		if (!acquired) {
+			goto exit;
+		}
 	}
 
 	// The per-index "explain" frame is raw BSON metadata the result server uses
