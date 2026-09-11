@@ -636,6 +636,9 @@ static const char *g_delay_loaded_dlls_minimal[] = {
 	"advapi32.dll",
 };
 
+static const char *g_delay_load_failures[ARRAYSIZE(g_delay_loaded_dlls)];
+static unsigned int g_delay_load_failure_count;
+
 static void resolve_delay_loaded_dlls(void)
 {
 	const char **dlls;
@@ -653,9 +656,22 @@ static void resolve_delay_loaded_dlls(void)
 	for (i = 0; i < count; i++) {
 		if (GetModuleHandleA(dlls[i]))
 			continue;
-		if (!LoadLibraryA(dlls[i]))
-			DebugOutput("resolve_delay_loaded_dlls: unable to load %s (error %d)\n", dlls[i], GetLastError());
+		if (!LoadLibraryA(dlls[i]) && g_delay_load_failure_count < ARRAYSIZE(g_delay_load_failures))
+			g_delay_load_failures[g_delay_load_failure_count++] = dlls[i];
 	}
+}
+
+//
+// Deferred because this runs before read_config(): DebugOutput() consults
+// g_config to decide between OutputDebugString and the log pipe, so it cannot
+// produce anything useful until the config has been parsed.
+//
+static void report_delay_load_failures(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < g_delay_load_failure_count; i++)
+		DebugOutput("resolve_delay_loaded_dlls: unable to load %s\n", g_delay_load_failures[i]);
 }
 
 //
@@ -704,6 +720,12 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 		g_osverinfo.dwOSVersionInfoSize = sizeof(OSVERSIONINFOA);
 		GetVersionEx(&g_osverinfo);
 
+#ifdef _WIN64
+		// before anything that touches a delay-loaded import, including the
+		// advapi32 lookup in resolve_runtime_apis() below
+		resolve_delay_loaded_dlls();
+#endif
+
 		resolve_runtime_apis();
 
 		init_private_heap();
@@ -724,6 +746,11 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 
 		// read the config settings
 		read_config();
+
+#ifdef _WIN64
+		// deferred from resolve_delay_loaded_dlls(): DebugOutput needs g_config
+		report_delay_load_failures();
+#endif
 
 		if (g_config.standalone) {
 			// initialize these because some hooks behave badly when they are empty
@@ -754,12 +781,6 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
 		for (i = 0; i < length / sizeof(pids[0]); i++) {
 			add_protected_pid(pids[i]);
 		}
-
-#ifdef _WIN64
-		// must run before the first delay-loaded import is touched (hkcu_init
-		// below) and before set_hooks()
-		resolve_delay_loaded_dlls();
-#endif
 
 		hkcu_init();
 
