@@ -46,23 +46,40 @@ static SOCKET g_sock;
 static HANDLE g_debug_log_handle;
 static unsigned int g_starttick;
 
-static char *g_buffer;
-static volatile int g_idx;
-static DWORD last_api_logged;
-static BOOLEAN special_api_triggered;
-static BOOLEAN delete_last_log;
 HANDLE g_log_handle;
 
 // current to-be-logged API call
 // Thread-local context structure - includes BSON state + active serializer pointer
+#define THREAD_LOG_RING_SIZE (1024 * 512) // 512KB Ring per thread
+
 typedef struct {
+	ULONG_PTR thread_id;
 	bson g_bson[1];
 	char g_istr[4];
 	log_serializer_t *active_serializer;  // Strategy pattern: BSON or Protobuf
-	// The protobuf context is ~100 KB (encode buffer + string scratch). It is
-	// only allocated on demand, on the first protobuf log made by this thread,
-	// so the default BSON path never pays for it.
 	protobuf_context_t *g_pb_ctx;
+
+	// SPSC offsets for the finished wire bytes
+	volatile ULONG write_idx; 
+	volatile ULONG read_idx;
+	ULONG buffer_size;
+	
+	// Lock-free deduplication state (replaces global lastlog_t)
+	unsigned char *last_buf;
+	unsigned int last_len;
+	unsigned int last_compare_len;
+	int *last_repeated_ptr;
+	unsigned char *last_compare_ptr;
+
+	// Thread-local API triggers (fixes cross-thread race condition globals)
+	DWORD last_api_logged;
+	BOOLEAN special_api_triggered;
+	BOOLEAN delete_last_log;
+	
+	ULONG dropped_records; 
+
+	// The encoded byte stream for the drain loop
+	unsigned char buffer[THREAD_LOG_RING_SIZE];
 } thread_log_context_t;
 
 #include <intrin.h>
