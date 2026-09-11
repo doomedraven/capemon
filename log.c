@@ -40,7 +40,7 @@ size_t buffer_log_max = BUFFER_LOG_MAX;
 size_t large_buffer_log_max = LARGE_BUFFER_LOG_MAX;
 #define BUFFER_REGVAL_MAX 512
 
-CRITICAL_SECTION g_mutex;
+
 CRITICAL_SECTION g_writing_log_buffer_mutex;
 static SOCKET g_sock;
 static HANDLE g_debug_log_handle;
@@ -291,7 +291,7 @@ log_serializer_t g_bson_serializer = {
 	.destroy = bson_serializer_destroy
 };
 
-static char logtbl_explained[256] = {0};
+static LONG logtbl_explained[256] = {0};
 
 #define LOG_ID_PROCESS 0
 #define LOG_ID_THREAD 1
@@ -320,40 +320,50 @@ extern int process_shutting_down;
 
 static void _send_log(void)
 {
-	EnterCriticalSection(&g_writing_log_buffer_mutex);
-	while (g_idx > 0) {
-		int written = -1;
+	if (!TryEnterCriticalSection(&g_writing_log_buffer_mutex)) return;
 
-		if (g_sock == DEBUG_SOCKET) {
-			if (g_debug_log_handle != INVALID_HANDLE_VALUE) {
-				WriteFile(g_debug_log_handle, g_buffer, g_idx, &written, NULL);
+	entry_t *pItem = (entry_t *)g_log_contexts.root;
+	while (pItem != NULL) {
+		thread_log_context_t *ring = (thread_log_context_t *)pItem->data;
+		
+		ULONG read = ring->read_idx;
+		ULONG write = ring->write_idx;
+
+		while (read != write) {
+			ULONG length = *(ULONG*)&ring->buffer[read];
+			
+			if (length == 0) {
+				// Marker for wrap-around
+				read = 0;
+				if (read == write) break;
+				length = *(ULONG*)&ring->buffer[read];
 			}
-			else {
-				// some non-admin debug case
-				written = g_idx;
+			
+			read += sizeof(ULONG);
+			
+			int written = -1;
+			if (g_sock == DEBUG_SOCKET) {
+				if (g_debug_log_handle != INVALID_HANDLE_VALUE) {
+					WriteFile(g_debug_log_handle, &ring->buffer[read], length, &written, NULL);
+				} else {
+					written = length;
+				}
+			} else {
+				if (g_log_handle != INVALID_HANDLE_VALUE) {
+					WriteFile(g_log_handle, &ring->buffer[read], length, &written, NULL);
+				}
 			}
+
+			if (written < 0) {
+				// Pipe failure or busy, abort drain for now
+				break;
+			}
+			
+			read += length;
+			if (read == THREAD_LOG_RING_SIZE) read = 0;
+			ring->read_idx = read;
 		}
-		else {
-			if (g_log_handle == INVALID_HANDLE_VALUE) {
-				g_idx = 0;
-				continue;
-			}
-			else {
-				WriteFile(g_log_handle, g_buffer, g_idx, &written, NULL);
-			}
-		}
-
-		if (written < 0)
-			continue;
-
-		// if this call didn't write the entire buffer, then we have to move
-		// around some stuff in the buffer
-		if (written < g_idx) {
-			memmove(g_buffer, g_buffer + written, g_idx - written);
-		}
-
-		// subtract the amount of written bytes from the index
-		g_idx -= written;
+		pItem = pItem->next;
 	}
 	LeaveCriticalSection(&g_writing_log_buffer_mutex);
 }
@@ -382,61 +392,56 @@ static DWORD WINAPI _logwatcher_thread(LPVOID param)
 
 extern BOOLEAN g_dll_main_complete;
 
-static lastlog_t lastlog;
 
 static void log_raw_direct(const char *buf, size_t length) {
-	size_t copiedlen = 0;
-	size_t copylen;
+	thread_log_context_t *ring = GetThreadLogContext();
+	if (!ring) return;
 
-	if (!g_buffer)
-		return;
-
-	while (copiedlen != length) {
-		EnterCriticalSection(&g_writing_log_buffer_mutex);
-		copylen = min((unsigned int)(length - copiedlen), (unsigned int)(BUFFERSIZE - g_idx));
-		memcpy(&g_buffer[g_idx], &buf[copiedlen], copylen);
-		g_idx += (int)copylen;
-		copiedlen += copylen;
-		LeaveCriticalSection(&g_writing_log_buffer_mutex);
-		if (copiedlen != length)
-			_send_log();
+	ULONG write = ring->write_idx;
+	ULONG read = ring->read_idx;
+	
+	ULONG free_space;
+	if (read > write) {
+		free_space = read - write - 1;
+	} else {
+		free_space = THREAD_LOG_RING_SIZE - write + read - 1;
 	}
+
+	if (length + sizeof(ULONG) > free_space) {
+		ring->dropped_records++;
+		return;
+	}
+
+	ULONG contiguous_space = THREAD_LOG_RING_SIZE - write;
+	if (length + sizeof(ULONG) > contiguous_space) {
+		memset(&ring->buffer[write], 0, contiguous_space);
+		write = 0;
+	}
+
+	*(ULONG*)&ring->buffer[write] = (ULONG)length;
+	write += sizeof(ULONG);
+
+	memcpy(&ring->buffer[write], buf, length);
+	write += (ULONG)length;
+
+	if (write == THREAD_LOG_RING_SIZE) {
+		write = 0;
+	}
+
+	MemoryBarrier();
+	ring->write_idx = write;
 }
 
 void log_flush()
 {
-	/* The logging thread we create in DllMain won't actually start until after DllMain
-	completes, so we need to ensure we don't wait here on the logging thread as it will
-	result in a deadlock.
-	There's thus an implicit assumption here that we won't log more than BUFFERSIZE before
-	DllMain completes, otherwise we'll lose logs.
-	*/
-	//if (g_dll_main_complete && !process_shutting_down) {
-	//	SetEvent(g_log_flush);
-	//	while (g_idx && (g_sock != INVALID_SOCKET)) raw_sleep(50);
-	//}
-	//else {
-	/* if we're in main() still, then send the logs immediately just in case something bad
-	happens early in execution of the malware's code
-	*/
-
-	//}
-	// we might get called by the pipe() code trying to flush logs before logging is
-	// actually initialized, so avoid any nastiness on trying to use unitialized
-	// critical sections
-
-	if (!TryEnterCriticalSection(&g_mutex))
-		return;
-
-	if (lastlog.buf) {
-		log_raw_direct(lastlog.buf, lastlog.len);
-		free(lastlog.buf);
-		lastlog.buf = NULL;
+	thread_log_context_t *ctx = GetThreadLogContext();
+	if (ctx && ctx->last_buf) {
+		log_raw_direct(ctx->last_buf, ctx->last_len);
+		free(ctx->last_buf);
+		ctx->last_buf = NULL;
 	}
-	LeaveCriticalSection(&g_mutex);
-
-	if (g_buffer)
-		_send_log();
+	
+	_send_log();
 }
 
 void debug_message(const char *msg) {
@@ -687,16 +692,18 @@ static void log_large_buffer(const char *buf, size_t length) {
 
 void set_special_api(DWORD API, BOOLEAN deleteLastLog)
 {
-	if (!TryEnterCriticalSection(&g_mutex))
-		return;
-	special_api_triggered = TRUE;
-	last_api_logged = API;
-	delete_last_log = deleteLastLog;
-	LeaveCriticalSection(&g_mutex);
+	thread_log_context_t *ctx = GetThreadLogContext();
+	if (!ctx) return;
+
+	ctx->special_api_triggered = TRUE;
+	ctx->last_api_logged = API;
+	ctx->delete_last_log = deleteLastLog;
 }
 DWORD get_last_api(void)
 {
-	return last_api_logged;
+	thread_log_context_t *ctx = GetThreadLogContext();
+	if (!ctx) return 0;
+	return ctx->last_api_logged;
 }
 
 void loq(int index, const char *category, const char *name,
@@ -719,56 +726,18 @@ void loq(int index, const char *category, const char *name,
 
 	hook_disable();
 
-	if (!TryEnterCriticalSection(&g_mutex))
-	{
-		int retries = 100;
-		BOOL acquired = FALSE;
 
-		while (retries-- > 0) {
-			if (TryEnterCriticalSection(&g_mutex)) {
-				acquired = TRUE;
-				break;
-			}
-			SwitchToThread();
-		}
-
-		if (!acquired) {
-			goto exit;
-		}
-	}
 
 	// The per-index "explain" frame is raw BSON metadata the result server uses
 	// to name argument positions. It has no protobuf equivalent, so in protobuf
 	// mode it must not be emitted - otherwise the stream is BSON frames
 	// interleaved with protobuf frames.
 	if (g_active_serializer == &g_bson_serializer &&
-		*(volatile char*)&logtbl_explained[index] == 0) {
+		logtbl_explained[index] == 0) {
 		const char * pname;
 		bson b[1];
 
-		{
-			int retries = 100;
-			BOOL acquired = FALSE;
-
-			while (retries-- > 0) {
-				if (TryEnterCriticalSection(&g_mutex)) {
-					acquired = TRUE;
-					break;
-				}
-				SwitchToThread();
-			}
-
-			if (!acquired) {
-				// Failed to acquire lock - skip explanation and return
-				hook_enable();
-				set_lasterrors(&lasterror);
-				return;
-			}
-		}
-
-		// Double-check inside the lock (proper double-checked locking pattern)
-		if (logtbl_explained[index] == 0) {
-			logtbl_explained[index] = 1;
+		if (InterlockedCompareExchange(&logtbl_explained[index], 1, 0) == 0) {
 
 			va_start(args, fmt);
 
@@ -908,42 +877,25 @@ void loq(int index, const char *category, const char *name,
 			// log_flush();
 			va_end(args);
 		}
-		LeaveCriticalSection(&g_mutex);
 	}
 
 	// Consume the special-API state now, before serialization. Serialization
 	// runs outside g_mutex (into thread-local buffers), so leaving this at the
 	// tail (post-serialization) would let a concurrent loq() on another thread
 	// observe a stale special_api_triggered / last_api_logged, or free
-	// lastlog.buf out from under the API that set_special_api() was meant for.
+	// ctx->last_buf out from under the API that set_special_api() was meant for.
 	{
-		int retries = 100;
-		BOOL acquired = FALSE;
-
-		while (retries-- > 0) {
-			if (TryEnterCriticalSection(&g_mutex)) {
-				acquired = TRUE;
-				break;
-			}
-			SwitchToThread();
-		}
-
-		if (!acquired) {
-			hook_enable();
-			set_lasterrors(&lasterror);
-			return;
-		}
-
-		if (!special_api_triggered)
-			last_api_logged = API_OTHER;
-		else {
-			special_api_triggered = FALSE;
-			if (delete_last_log) {
-				free(lastlog.buf);
-				lastlog.buf = NULL;
+		if (ctx) {
+			if (!ctx->special_api_triggered)
+				ctx->last_api_logged = API_OTHER;
+			else {
+				ctx->special_api_triggered = FALSE;
+				if (ctx->delete_last_log) {
+					free(ctx->last_buf);
+					ctx->last_buf = NULL;
+				}
 			}
 		}
-		LeaveCriticalSection(&g_mutex);
 	}
 
 	fmt = fmtbak;
@@ -1354,21 +1306,7 @@ buffer_log:
 	s->append_finish();
 
 	{
-		int retries = 100;
-		BOOL acquired = FALSE;
 
-		while (retries-- > 0) {
-			if (TryEnterCriticalSection(&g_mutex)) {
-				acquired = TRUE;
-				break;
-			}
-			SwitchToThread();
-		}
-
-		if (!acquired) {
-			s->destroy();
-			goto exit;
-		}
 	}
 
 	// special-API state was already consumed above, before serialization.
@@ -1380,30 +1318,30 @@ buffer_log:
 	else {
 		// Caching and duplicate-checking are exclusive to BSON formatting (due to Protobuf's frame encapsulation)
 		if (s == &g_bson_serializer) {
-			if (lastlog.buf) {
+			if (ctx->last_buf) {
 				// BSON documents are bounded by BUFFERSIZE (16 MB); the
 				// size_t -> unsigned int narrowing here is safe.
 				unsigned int our_len = (unsigned int)s->get_size() - compare_offset;
-				if (lastlog.compare_len == our_len && !memcmp(lastlog.compare_ptr, s->get_data() + compare_offset, our_len)) {
-					(*lastlog.repeated_ptr)++;
+				if (ctx->last_compare_len == our_len && !memcmp(ctx->last_compare_ptr, s->get_data() + compare_offset, our_len)) {
+					(*ctx->last_repeated_ptr)++;
 				}
 				else {
 					if (g_config.force_flush == 1)
 						log_flush();
 					else {
-						log_raw_direct(lastlog.buf, lastlog.len);
-						free(lastlog.buf);
-						lastlog.buf = NULL;
+						log_raw_direct(ctx->last_buf, ctx->last_len);
+						free(ctx->last_buf);
+						ctx->last_buf = NULL;
 					}
 				}
 			}
-			if (lastlog.buf == NULL) {
-				lastlog.len = (unsigned int)s->get_size();
-				lastlog.buf = malloc(lastlog.len);
-				memcpy(lastlog.buf, s->get_data(), lastlog.len);
-				lastlog.compare_len = lastlog.len - compare_offset;
-				lastlog.compare_ptr = lastlog.buf + compare_offset;
-				lastlog.repeated_ptr = (int *)(lastlog.buf + repeat_offset);
+			if (ctx->last_buf == NULL) {
+				ctx->last_len = (unsigned int)s->get_size();
+				ctx->last_buf = malloc(ctx->last_len);
+				memcpy(ctx->last_buf, s->get_data(), ctx->last_len);
+				ctx->last_compare_len = ctx->last_len - compare_offset;
+				ctx->last_compare_ptr = ctx->last_buf + compare_offset;
+				ctx->last_repeated_ptr = (int *)(ctx->last_buf + repeat_offset);
 			}
 		} else {
 			// For Protobuf, write directly to result server
@@ -1412,7 +1350,6 @@ buffer_log:
 	}
 
 	s->destroy();
-	LeaveCriticalSection(&g_mutex);
 exit:
 	if (g_config.force_flush == 2)
 		log_flush();
@@ -1693,7 +1630,7 @@ DWORD g_logwatcher_thread_id;
 
 void log_init(int debug)
 {
-	g_buffer = calloc(1, BUFFERSIZE);
+	
 
 	g_log_flush = CreateEvent(NULL, FALSE, FALSE, NULL);
 
