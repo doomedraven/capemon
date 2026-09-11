@@ -65,23 +65,50 @@ typedef struct {
 	protobuf_context_t *g_pb_ctx;
 } thread_log_context_t;
 
-DWORD g_bson_tls_index = TLS_OUT_OF_INDEXES;
+#include <intrin.h>
 
+lookup_t g_log_contexts;
+
+extern log_serializer_t g_bson_serializer;
+extern log_serializer_t g_protobuf_serializer;
 log_serializer_t *g_default_serializer = &g_bson_serializer;
 
-// Thread-local storage with caching to avoid repeated TLS lookups
+// O(1) TEB Accessor macro for ArbitraryUserPointer (Offset 0x14 on x86, 0x28 on x64)
+static __forceinline thread_log_context_t* get_teb_context() {
+#ifdef _WIN64
+	return (thread_log_context_t*)__readgsqword(0x28);
+#else
+	return (thread_log_context_t*)__readfsdword(0x14);
+#endif
+}
+
+static __forceinline void set_teb_context(thread_log_context_t* ctx) {
+#ifdef _WIN64
+	__writegsqword(0x28, (ULONG64)ctx);
+#else
+	__writefsdword(0x14, (ULONG)ctx);
+#endif
+}
+
 static thread_log_context_t* GetThreadLogContext(void) {
-	thread_log_context_t* pCtx = NULL;
-	if (g_bson_tls_index != TLS_OUT_OF_INDEXES) {
-		pCtx = (thread_log_context_t*)TlsGetValue(g_bson_tls_index);
-		if (!pCtx) {
-			pCtx = (thread_log_context_t*)calloc(1, sizeof(thread_log_context_t));
-			if (pCtx) {
-				pCtx->active_serializer = g_default_serializer;  // Use configured default
-				TlsSetValue(g_bson_tls_index, pCtx);
-			}
-		}
+	thread_log_context_t* pCtx = get_teb_context();
+	if (pCtx) {
+		return pCtx;
 	}
+
+	ULONG_PTR tid = GetCurrentThreadId();
+	unsigned int size;
+	pCtx = (thread_log_context_t*)lookup_get(&g_log_contexts, tid, &size);
+	if (!pCtx) {
+		pCtx = (thread_log_context_t*)lookup_add(&g_log_contexts, tid, sizeof(thread_log_context_t));
+		memset(pCtx, 0, sizeof(thread_log_context_t));
+		pCtx->active_serializer = g_default_serializer;
+	}
+
+	if (get_teb_context() == NULL) {
+		set_teb_context(pCtx);
+	}
+	
 	return pCtx;
 }
 
@@ -94,10 +121,7 @@ protobuf_context_t* get_thread_pb_ctx(void) {
 	return pCtx->g_pb_ctx;
 }
 
-// Single-lookup accessors. Every caller runs after loq() has already verified
-// that GetThreadLogContext() is non-NULL for this thread, but the NULL guards
-// are kept as cheap defensive fallbacks. Each accessor performs exactly one
-// TLS lookup (the previous macros did two per expansion).
+// Single-lookup accessors
 static __inline bson *log_ctx_bson(void) {
 	thread_log_context_t *c = GetThreadLogContext();
 	return c ? c->g_bson : NULL;
@@ -115,14 +139,13 @@ static __inline log_serializer_t *log_ctx_serializer(void) {
 #define g_active_serializer (log_ctx_serializer())
 
 void TlsThreadCleanup(void) {
-	if (g_bson_tls_index != TLS_OUT_OF_INDEXES) {
-		thread_log_context_t* pCtx = (thread_log_context_t*)TlsGetValue(g_bson_tls_index);
-		if (pCtx) {
-			free(pCtx->g_pb_ctx);
-			free(pCtx);
-			TlsSetValue(g_bson_tls_index, NULL);
-		}
+	thread_log_context_t* pCtx = get_teb_context();
+	if (pCtx) {
+		free(pCtx->g_pb_ctx);
+		pCtx->g_pb_ctx = NULL;
+		set_teb_context(NULL);
 	}
+	lookup_del(&g_log_contexts, GetCurrentThreadId());
 }
 
 // BSON Serializer Implementation (wraps existing BSON functions)
@@ -1643,8 +1666,6 @@ DWORD g_logwatcher_thread_id;
 
 void log_init(int debug)
 {
-	g_bson_tls_index = TlsAlloc();
-
 	g_buffer = calloc(1, BUFFERSIZE);
 
 	g_log_flush = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -1712,11 +1733,7 @@ void log_init(int debug)
 void log_free()
 {
 	log_flush();
-	if (g_bson_tls_index != TLS_OUT_OF_INDEXES) {
-		TlsThreadCleanup();
-		TlsFree(g_bson_tls_index);
-		g_bson_tls_index = TLS_OUT_OF_INDEXES;
-	}
+	TlsThreadCleanup();
 	if (g_sock == DEBUG_SOCKET) {
 		g_sock = INVALID_SOCKET;
 	}
